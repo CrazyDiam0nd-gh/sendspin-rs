@@ -44,6 +44,16 @@ impl CorrectionPlanner {
         }
     }
 
+    /// A planner whose speed correction is capped at `max_speed_correction`
+    /// (a fraction of real time, e.g. `0.005` for 0.5%) instead of the
+    /// default. Thresholds are unchanged.
+    pub fn with_max_speed_correction(max_speed_correction: f64) -> Self {
+        Self {
+            max_speed_correction,
+            ..Self::new()
+        }
+    }
+
     /// Plan a correction schedule from sync error and sample rate.
     ///
     /// `error_us` is the sync error in microseconds (positive = ahead, negative = behind).
@@ -260,6 +270,99 @@ impl EngageGate {
 }
 
 impl Default for EngageGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Callbacks per comparison window of [`OutputDelaySettle`]: ~0.5s at a 10ms
+/// period.
+pub(crate) const OUTPUT_DELAY_SETTLE_WINDOW: usize = 50;
+
+/// How far the output-delay floor may move between two consecutive windows
+/// and still count as stable.
+pub(crate) const OUTPUT_DELAY_SETTLE_TOLERANCE_US: u64 = 10_000;
+
+/// Consecutive stable windows required before the delay counts as settled
+/// (~2s at a 10ms period). The relaxation after a cold start has plateaus
+/// near its peak that last a fraction of a second; requiring a longer run
+/// keeps one of those from being mistaken for the resting value.
+pub(crate) const OUTPUT_DELAY_SETTLE_STABLE_WINDOWS: u32 = 4;
+
+/// Detects when the output delay reported by the audio backend has stopped
+/// moving.
+///
+/// A freshly opened output stream is not in steady state. On some backends
+/// (observed with ALSA over PulseAudio/PipeWire) the reported presentation
+/// delay of a cold stream overshoots by a few hundred milliseconds in the
+/// first second and then relaxes back over several seconds. The audio itself
+/// plays gaplessly; only the estimate moves. The sync error is measured
+/// against that estimate, so it swings by the same amount, and correcting for
+/// it speeds playback up and then slows it down, which is audible as a
+/// warble.
+///
+/// The tracker compares the minimum delay seen in consecutive windows of
+/// [`OUTPUT_DELAY_SETTLE_WINDOW`] callbacks. The minimum, not the mean, is
+/// used for the same reason as in [`SyncErrorFilter`]: the delay can flap
+/// upward by a whole period while its floor holds. The delay counts as
+/// settled once [`OUTPUT_DELAY_SETTLE_STABLE_WINDOWS`] consecutive window
+/// floors each differ from the previous by no more than
+/// [`OUTPUT_DELAY_SETTLE_TOLERANCE_US`].
+///
+/// Allocation-free; sized for the audio callback.
+#[derive(Debug, Clone)]
+pub(crate) struct OutputDelaySettle {
+    window_min_us: u64,
+    window_len: usize,
+    prev_window_min_us: Option<u64>,
+    stable_windows: u32,
+}
+
+impl OutputDelaySettle {
+    /// Create a tracker that reports not-settled until two windows have been
+    /// compared.
+    pub fn new() -> Self {
+        Self {
+            window_min_us: u64::MAX,
+            window_len: 0,
+            prev_window_min_us: None,
+            stable_windows: 0,
+        }
+    }
+
+    /// Forget all history, e.g. when a new stream generation starts.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// True once enough consecutive windows agree within the tolerance. Goes
+    /// false again if the delay moves, and after
+    /// [`OutputDelaySettle::reset`].
+    pub fn is_settled(&self) -> bool {
+        self.stable_windows >= OUTPUT_DELAY_SETTLE_STABLE_WINDOWS
+    }
+
+    /// Record one callback's output delay (µs).
+    pub fn update(&mut self, delay_us: u64) {
+        self.window_min_us = self.window_min_us.min(delay_us);
+        self.window_len += 1;
+        if self.window_len < OUTPUT_DELAY_SETTLE_WINDOW {
+            return;
+        }
+        if let Some(prev) = self.prev_window_min_us {
+            if self.window_min_us.abs_diff(prev) <= OUTPUT_DELAY_SETTLE_TOLERANCE_US {
+                self.stable_windows = self.stable_windows.saturating_add(1);
+            } else {
+                self.stable_windows = 0;
+            }
+        }
+        self.prev_window_min_us = Some(self.window_min_us);
+        self.window_min_us = u64::MAX;
+        self.window_len = 0;
+    }
+}
+
+impl Default for OutputDelaySettle {
     fn default() -> Self {
         Self::new()
     }
@@ -605,5 +708,133 @@ mod tests {
             !disengage.is_correcting(),
             "disengage must pass immediately"
         );
+    }
+
+    fn feed(tracker: &mut OutputDelaySettle, delays_us: impl Iterator<Item = u64>) {
+        for d in delays_us {
+            tracker.update(d);
+        }
+    }
+
+    /// Callbacks needed to compare enough windows to be settled: one window to
+    /// establish a floor plus the required number of stable comparisons.
+    const SETTLE_CALLBACKS: usize =
+        OUTPUT_DELAY_SETTLE_WINDOW * (OUTPUT_DELAY_SETTLE_STABLE_WINDOWS as usize + 1);
+
+    #[test]
+    fn test_delay_settle_needs_several_stable_windows() {
+        let mut t = OutputDelaySettle::new();
+        feed(
+            &mut t,
+            std::iter::repeat_n(250_000, SETTLE_CALLBACKS - OUTPUT_DELAY_SETTLE_WINDOW),
+        );
+        assert!(!t.is_settled(), "too few windows to be settled");
+        feed(
+            &mut t,
+            std::iter::repeat_n(250_000, OUTPUT_DELAY_SETTLE_WINDOW),
+        );
+        assert!(t.is_settled(), "enough identical windows are settled");
+    }
+
+    #[test]
+    fn test_delay_settle_ignores_period_flapping() {
+        // Delay alternates between two values one engine period apart while
+        // its floor holds, as observed on shared-mode backends.
+        let mut t = OutputDelaySettle::new();
+        let flapping =
+            (0..SETTLE_CALLBACKS * 2).map(|i| if i % 2 == 0 { 280_000 } else { 290_600 });
+        feed(&mut t, flapping);
+        assert!(t.is_settled());
+    }
+
+    #[test]
+    fn test_delay_settle_rejects_cold_start_ramp() {
+        // Rising ~10ms per callback, as in the first second of a cold stream.
+        let mut t = OutputDelaySettle::new();
+        feed(
+            &mut t,
+            (0..SETTLE_CALLBACKS * 2).map(|i| 10_000 + i as u64 * 10_000),
+        );
+        assert!(!t.is_settled(), "a rising delay is not settled");
+    }
+
+    #[test]
+    fn test_delay_settle_rejects_slow_relaxation() {
+        // Falling ~0.5ms per callback (25ms per window), as the delay relaxes
+        // after the overshoot.
+        let mut t = OutputDelaySettle::new();
+        feed(
+            &mut t,
+            (0..SETTLE_CALLBACKS * 2).map(|i| 550_000 - i as u64 * 500),
+        );
+        assert!(!t.is_settled(), "a still-relaxing delay is not settled");
+    }
+
+    #[test]
+    fn test_delay_settle_rejects_plateau_before_further_relaxation() {
+        // Observed on a cold ALSA-over-PulseAudio stream: the delay rests near
+        // 475ms for about a second, then keeps relaxing toward ~256ms. The
+        // plateau alone must not count as settled.
+        let mut t = OutputDelaySettle::new();
+        let plateau = OUTPUT_DELAY_SETTLE_WINDOW * 3;
+        feed(&mut t, std::iter::repeat_n(475_000, plateau));
+        assert!(!t.is_settled(), "a short plateau is not settled");
+        feed(
+            &mut t,
+            (0..OUTPUT_DELAY_SETTLE_WINDOW * 4).map(|i| 475_000 - i as u64 * 1_000),
+        );
+        assert!(!t.is_settled(), "relaxation after the plateau resets it");
+    }
+
+    #[test]
+    fn test_delay_settle_recovers_after_ramp() {
+        let mut t = OutputDelaySettle::new();
+        feed(
+            &mut t,
+            (0..OUTPUT_DELAY_SETTLE_WINDOW * 2).map(|i| 10_000 + i as u64 * 10_000),
+        );
+        assert!(!t.is_settled());
+        feed(&mut t, std::iter::repeat_n(300_000, SETTLE_CALLBACKS * 2));
+        assert!(t.is_settled(), "settles once the delay stops moving");
+    }
+
+    #[test]
+    fn test_delay_settle_unsettles_when_delay_moves_again() {
+        let mut t = OutputDelaySettle::new();
+        feed(&mut t, std::iter::repeat_n(300_000, SETTLE_CALLBACKS * 2));
+        assert!(t.is_settled());
+        feed(
+            &mut t,
+            std::iter::repeat_n(400_000, OUTPUT_DELAY_SETTLE_WINDOW),
+        );
+        assert!(!t.is_settled(), "a step in the delay un-settles it");
+    }
+
+    #[test]
+    fn test_delay_settle_reset_clears_state() {
+        let mut t = OutputDelaySettle::new();
+        feed(&mut t, std::iter::repeat_n(250_000, SETTLE_CALLBACKS * 2));
+        assert!(t.is_settled());
+        t.reset();
+        assert!(!t.is_settled());
+    }
+
+    #[test]
+    fn test_capped_planner_limits_speed_correction() {
+        // 100ms of error would normally be corrected at the 4% cap.
+        let default = CorrectionPlanner::new().plan(100_000, 48_000, false);
+        let capped =
+            CorrectionPlanner::with_max_speed_correction(0.005).plan(100_000, 48_000, false);
+        assert_eq!(default.drop_every_n_frames, 25, "4% = one frame in 25");
+        assert_eq!(capped.drop_every_n_frames, 200, "0.5% = one frame in 200");
+        assert!(!capped.reanchor);
+    }
+
+    #[test]
+    fn test_capped_planner_keeps_thresholds() {
+        let capped = CorrectionPlanner::with_max_speed_correction(0.005);
+        assert!(!capped.plan(2_500, 48_000, false).is_correcting());
+        assert!(capped.plan(3_500, 48_000, false).is_correcting());
+        assert!(capped.plan(500_000, 48_000, false).reanchor);
     }
 }
