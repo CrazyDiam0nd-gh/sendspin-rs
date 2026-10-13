@@ -765,7 +765,6 @@ impl SyncedPlayer {
         let mut sync_settle_logged = false;
         // Output-delay settling after stream start; see OutputDelaySettle.
         let mut delay_settle = OutputDelaySettle::new();
-        let mut delay_settle_logged = false;
         let mut started_at: Option<Instant> = None;
         let mut last_callback_instant: Option<Instant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
@@ -876,7 +875,6 @@ impl SyncedPlayer {
                         engage_gate.reset();
                         min_playback_delta_us = u64::MAX;
                         delay_settle.reset();
-                        delay_settle_logged = false;
                         started_at = None;
                         stats.reset_for_generation();
                         for sample in last_frame.iter_mut() {
@@ -922,19 +920,21 @@ impl SyncedPlayer {
                     }
                     last_playback_delta_us = Some(playback_delta_us);
                     min_playback_delta_us = min_playback_delta_us.min(playback_delta_us);
-                    delay_settle.update(playback_delta_us);
-                    if delay_settle.is_settled() && !delay_settle_logged {
-                        delay_settle_logged = true;
-                        // Everything measured so far describes the start-up
-                        // transient, including the all-time delta floor,
-                        // which would otherwise stay pinned to the first
-                        // (cold-stream) reading.
-                        min_playback_delta_us = playback_delta_us;
+                    let delay_was_settled = delay_settle.is_settled();
+                    delay_settle.update(callback_instant, playback_delta_us);
+                    if let Some(floor_us) = delay_settle
+                        .settled_floor_us()
+                        .filter(|_| !delay_was_settled)
+                    {
+                        // Each new stable interval supersedes the transient's
+                        // measurements. Anchor to its floor, not a callback
+                        // sample that may flap upward by an engine period.
+                        min_playback_delta_us = floor_us;
                         error_filter.reset();
                         engage_gate.reset();
                         log::debug!(
                             "Output delay settled at {:.1}ms; corrections enabled: callback={}, suppressed_during_transient={}, generation={}",
-                            us_to_ms(playback_delta_us),
+                            us_to_ms(floor_us),
                             stats.callbacks,
                             stats.delay_transient_suppressed_corrections,
                             generation,

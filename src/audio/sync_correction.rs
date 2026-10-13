@@ -1,6 +1,8 @@
 // ABOUTME: Sync correction planner for drop/insert cadence, plus the
 // ABOUTME: measurement filter and engage gate that keep it off phantom errors
 
+use std::time::{Duration, Instant};
+
 /// Correction schedule for drop/insert cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CorrectionSchedule {
@@ -275,58 +277,43 @@ impl Default for EngageGate {
     }
 }
 
-/// Callbacks per comparison window of [`OutputDelaySettle`]: ~0.5s at a 10ms
-/// period.
-pub(crate) const OUTPUT_DELAY_SETTLE_WINDOW: usize = 50;
+/// Observation window for the minimum reported output delay.
+pub(crate) const OUTPUT_DELAY_SETTLE_WINDOW: Duration = Duration::from_millis(500);
 
-/// How far the output-delay floor may move between two consecutive windows
-/// and still count as stable.
+/// Maximum range of window floors over the entire stability interval.
 pub(crate) const OUTPUT_DELAY_SETTLE_TOLERANCE_US: u64 = 10_000;
 
-/// Consecutive stable windows required before the delay counts as settled
-/// (~2s at a 10ms period). The relaxation after a cold start has plateaus
-/// near its peak that last a fraction of a second; requiring a longer run
-/// keeps one of those from being mistaken for the resting value.
-pub(crate) const OUTPUT_DELAY_SETTLE_STABLE_WINDOWS: u32 = 4;
+/// Time required to confirm a baseline floor. Short cold-start plateaus must
+/// not enable corrections before the output-delay estimate finishes relaxing.
+pub(crate) const OUTPUT_DELAY_SETTLE_STABLE_DURATION: Duration = Duration::from_secs(2);
 
-/// Detects when the output delay reported by the audio backend has stopped
-/// moving.
-///
-/// A freshly opened output stream is not in steady state. On some backends
-/// (observed with ALSA over PulseAudio/PipeWire) the reported presentation
-/// delay of a cold stream overshoots by a few hundred milliseconds in the
-/// first second and then relaxes back over several seconds. The audio itself
-/// plays gaplessly; only the estimate moves. The sync error is measured
-/// against that estimate, so it swings by the same amount, and correcting for
-/// it speeds playback up and then slows it down, which is audible as a
-/// warble.
-///
-/// The tracker compares the minimum delay seen in consecutive windows of
-/// [`OUTPUT_DELAY_SETTLE_WINDOW`] callbacks. The minimum, not the mean, is
-/// used for the same reason as in [`SyncErrorFilter`]: the delay can flap
-/// upward by a whole period while its floor holds. The delay counts as
-/// settled once [`OUTPUT_DELAY_SETTLE_STABLE_WINDOWS`] consecutive window
-/// floors each differ from the previous by no more than
-/// [`OUTPUT_DELAY_SETTLE_TOLERANCE_US`].
-///
-/// Allocation-free; sized for the audio callback.
+// One baseline window followed by the stability interval's comparison windows.
+const OUTPUT_DELAY_SETTLE_FLOORS: usize = 1
+    + (OUTPUT_DELAY_SETTLE_STABLE_DURATION.as_millis() / OUTPUT_DELAY_SETTLE_WINDOW.as_millis())
+        as usize;
+
+/// Uses monotonic-time windows so callback cadence cannot shorten settling.
+/// Window minima ignore upward period flapping; their full range must fit the
+/// tolerance so successive small steps cannot hide a ramp. Allocation-free.
 #[derive(Debug, Clone)]
 pub(crate) struct OutputDelaySettle {
     window_min_us: u64,
-    window_len: usize,
-    prev_window_min_us: Option<u64>,
-    stable_windows: u32,
+    window_started_at: Option<Instant>,
+    last_observation_at: Option<Instant>,
+    floors: [u64; OUTPUT_DELAY_SETTLE_FLOORS],
+    floors_len: usize,
+    next_floor: usize,
 }
 
 impl OutputDelaySettle {
-    /// Create a tracker that reports not-settled until two windows have been
-    /// compared.
     pub fn new() -> Self {
         Self {
             window_min_us: u64::MAX,
-            window_len: 0,
-            prev_window_min_us: None,
-            stable_windows: 0,
+            window_started_at: None,
+            last_observation_at: None,
+            floors: [0; OUTPUT_DELAY_SETTLE_FLOORS],
+            floors_len: 0,
+            next_floor: 0,
         }
     }
 
@@ -335,30 +322,47 @@ impl OutputDelaySettle {
         *self = Self::new();
     }
 
-    /// True once enough consecutive windows agree within the tolerance. Goes
-    /// false again if the delay moves, and after
-    /// [`OutputDelaySettle::reset`].
     pub fn is_settled(&self) -> bool {
-        self.stable_windows >= OUTPUT_DELAY_SETTLE_STABLE_WINDOWS
+        self.settled_floor_us().is_some()
     }
 
-    /// Record one callback's output delay (µs).
-    pub fn update(&mut self, delay_us: u64) {
-        self.window_min_us = self.window_min_us.min(delay_us);
-        self.window_len += 1;
-        if self.window_len < OUTPUT_DELAY_SETTLE_WINDOW {
-            return;
+    /// The observed floor, available only after the stability interval agrees.
+    /// Reanchors must use this floor rather than a possibly high callback sample.
+    pub fn settled_floor_us(&self) -> Option<u64> {
+        if self.floors_len < OUTPUT_DELAY_SETTLE_FLOORS {
+            return None;
         }
-        if let Some(prev) = self.prev_window_min_us {
-            if self.window_min_us.abs_diff(prev) <= OUTPUT_DELAY_SETTLE_TOLERANCE_US {
-                self.stable_windows = self.stable_windows.saturating_add(1);
-            } else {
-                self.stable_windows = 0;
+        let min = *self.floors.iter().min().unwrap();
+        let max = *self.floors.iter().max().unwrap();
+        (max - min <= OUTPUT_DELAY_SETTLE_TOLERANCE_US).then_some(min)
+    }
+
+    /// Record one callback's output delay (µs). A gap of a full observation
+    /// window invalidates the evidence: unobserved time is not stable time.
+    pub fn update(&mut self, now: Instant, delay_us: u64) {
+        if self
+            .last_observation_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= OUTPUT_DELAY_SETTLE_WINDOW)
+        {
+            self.reset();
+        }
+        self.last_observation_at = Some(now);
+
+        if let Some(start) = self.window_started_at {
+            if now.saturating_duration_since(start) >= OUTPUT_DELAY_SETTLE_WINDOW {
+                self.floors[self.next_floor] = self.window_min_us;
+                self.next_floor = (self.next_floor + 1) % OUTPUT_DELAY_SETTLE_FLOORS;
+                self.floors_len = (self.floors_len + 1).min(OUTPUT_DELAY_SETTLE_FLOORS);
+                // Begin at the actual observation, not an earlier nominal
+                // boundary: overshoot must never shorten the next window.
+                self.window_started_at = Some(now);
+                self.window_min_us = delay_us;
+                return;
             }
+        } else {
+            self.window_started_at = Some(now);
         }
-        self.prev_window_min_us = Some(self.window_min_us);
-        self.window_min_us = u64::MAX;
-        self.window_len = 0;
+        self.window_min_us = self.window_min_us.min(delay_us);
     }
 }
 
@@ -710,113 +714,228 @@ mod tests {
         );
     }
 
-    fn feed(tracker: &mut OutputDelaySettle, delays_us: impl Iterator<Item = u64>) {
-        for d in delays_us {
-            tracker.update(d);
+    const SETTLE_TIME: Duration =
+        OUTPUT_DELAY_SETTLE_WINDOW.saturating_add(OUTPUT_DELAY_SETTLE_STABLE_DURATION);
+
+    fn callback_periods() -> [Duration; 4] {
+        [
+            Duration::from_secs_f64(64.0 / 48_000.0),
+            Duration::from_secs_f64(128.0 / 48_000.0),
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+        ]
+    }
+
+    fn replay(
+        period: Duration,
+        duration: Duration,
+        delay: impl Fn(Duration, usize) -> u64,
+        mut observe: impl FnMut(Duration, &OutputDelaySettle),
+    ) {
+        let start = Instant::now();
+        let mut tracker = OutputDelaySettle::new();
+        let mut elapsed = Duration::ZERO;
+        let mut callback = 0;
+        while elapsed <= duration {
+            tracker.update(start + elapsed, delay(elapsed, callback));
+            observe(elapsed, &tracker);
+            elapsed += period;
+            callback += 1;
         }
     }
 
-    /// Callbacks needed to compare enough windows to be settled: one window to
-    /// establish a floor plus the required number of stable comparisons.
-    const SETTLE_CALLBACKS: usize =
-        OUTPUT_DELAY_SETTLE_WINDOW * (OUTPUT_DELAY_SETTLE_STABLE_WINDOWS as usize + 1);
-
     #[test]
-    fn test_delay_settle_needs_several_stable_windows() {
-        let mut t = OutputDelaySettle::new();
-        feed(
-            &mut t,
-            std::iter::repeat_n(250_000, SETTLE_CALLBACKS - OUTPUT_DELAY_SETTLE_WINDOW),
-        );
-        assert!(!t.is_settled(), "too few windows to be settled");
-        feed(
-            &mut t,
-            std::iter::repeat_n(250_000, OUTPUT_DELAY_SETTLE_WINDOW),
-        );
-        assert!(t.is_settled(), "enough identical windows are settled");
+    fn test_delay_settle_uses_elapsed_time_at_all_cadences() {
+        for period in callback_periods() {
+            let mut first_settled = None;
+            replay(
+                period,
+                SETTLE_TIME + OUTPUT_DELAY_SETTLE_WINDOW,
+                |_, _| 250_000,
+                |elapsed, tracker| {
+                    if tracker.is_settled() && first_settled.is_none() {
+                        first_settled = Some(elapsed);
+                    }
+                },
+            );
+            let elapsed = first_settled.expect("constant delay must settle");
+            assert!(elapsed >= SETTLE_TIME, "must observe the whole interval");
+            assert!(elapsed <= SETTLE_TIME + period * OUTPUT_DELAY_SETTLE_FLOORS as u32);
+        }
     }
 
     #[test]
-    fn test_delay_settle_ignores_period_flapping() {
-        // Delay alternates between two values one engine period apart while
-        // its floor holds, as observed on shared-mode backends.
-        let mut t = OutputDelaySettle::new();
-        let flapping =
-            (0..SETTLE_CALLBACKS * 2).map(|i| if i % 2 == 0 { 280_000 } else { 290_600 });
-        feed(&mut t, flapping);
-        assert!(t.is_settled());
+    fn test_delay_settle_ignores_period_flapping_and_returns_floor() {
+        for period in callback_periods() {
+            let mut final_floor = None;
+            replay(
+                period,
+                SETTLE_TIME + OUTPUT_DELAY_SETTLE_WINDOW,
+                |_, i| if i % 2 == 0 { 280_000 } else { 290_600 },
+                |_, tracker| {
+                    final_floor = tracker.settled_floor_us();
+                },
+            );
+            assert_eq!(final_floor, Some(280_000));
+        }
     }
 
     #[test]
-    fn test_delay_settle_rejects_cold_start_ramp() {
-        // Rising ~10ms per callback, as in the first second of a cold stream.
-        let mut t = OutputDelaySettle::new();
-        feed(
-            &mut t,
-            (0..SETTLE_CALLBACKS * 2).map(|i| 10_000 + i as u64 * 10_000),
+    fn test_delay_settle_rejects_ramps_at_all_cadences() {
+        for period in callback_periods() {
+            // 20ms/s moves only 10ms per nominal window, but 40ms over
+            // the comparison interval. Adjacent comparisons are insufficient.
+            for rate in [20_000, 50_000] {
+                for rising in [false, true] {
+                    replay(
+                        period,
+                        Duration::from_secs(5),
+                        |elapsed, _| {
+                            let change = (elapsed.as_secs_f64() * rate as f64) as u64;
+                            if rising {
+                                550_000 + change
+                            } else {
+                                550_000 - change
+                            }
+                        },
+                        |_, tracker| assert!(!tracker.is_settled(), "a ramp must not settle"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_delay_settle_rejects_plateau_then_recovers_after_relaxation() {
+        for period in callback_periods() {
+            let mut settled = false;
+            replay(
+                period,
+                Duration::from_secs(7),
+                |elapsed, _| {
+                    let seconds = elapsed.as_secs_f64();
+                    if seconds < 1.0 {
+                        475_000
+                    } else if seconds < 4.0 {
+                        475_000 - ((seconds - 1.0) * 50_000.0) as u64
+                    } else {
+                        325_000
+                    }
+                },
+                |elapsed, tracker| {
+                    if elapsed < Duration::from_secs(4) {
+                        assert!(!tracker.is_settled(), "plateau and ramp are transient");
+                    }
+                    settled = tracker.is_settled();
+                },
+            );
+            assert!(settled, "must recover once the floor stops moving");
+        }
+    }
+
+    #[test]
+    fn test_delay_settle_unsettles_and_settles_again() {
+        let period = Duration::from_millis(10);
+        let step_at = SETTLE_TIME + OUTPUT_DELAY_SETTLE_WINDOW;
+        let mut transitions = 0;
+        let mut was_settled = false;
+        let mut unsettled_after_step = false;
+        replay(
+            period,
+            step_at + SETTLE_TIME + OUTPUT_DELAY_SETTLE_WINDOW,
+            |elapsed, _| if elapsed < step_at { 300_000 } else { 400_000 },
+            |elapsed, tracker| {
+                let settled = tracker.is_settled();
+                if settled && !was_settled {
+                    transitions += 1;
+                }
+                if elapsed > step_at && !settled {
+                    unsettled_after_step = true;
+                }
+                if settled && elapsed > step_at + SETTLE_TIME {
+                    assert_eq!(tracker.settled_floor_us(), Some(400_000));
+                }
+                was_settled = settled;
+            },
         );
-        assert!(!t.is_settled(), "a rising delay is not settled");
+        assert!(unsettled_after_step);
+        assert_eq!(transitions, 2);
+        assert!(was_settled);
     }
 
     #[test]
-    fn test_delay_settle_rejects_slow_relaxation() {
-        // Falling ~0.5ms per callback (25ms per window), as the delay relaxes
-        // after the overshoot.
-        let mut t = OutputDelaySettle::new();
-        feed(
-            &mut t,
-            (0..SETTLE_CALLBACKS * 2).map(|i| 550_000 - i as u64 * 500),
-        );
-        assert!(!t.is_settled(), "a still-relaxing delay is not settled");
+    fn test_delay_settle_tolerance_boundary() {
+        for range in [
+            OUTPUT_DELAY_SETTLE_TOLERANCE_US,
+            OUTPUT_DELAY_SETTLE_TOLERANCE_US + 1,
+        ] {
+            let start = Instant::now();
+            let period = Duration::from_millis(10);
+            let callbacks = (SETTLE_TIME.as_nanos() / period.as_nanos()) as u32;
+            let mut tracker = OutputDelaySettle::new();
+            for i in 0..=callbacks {
+                let elapsed = period * i;
+                let delay = if elapsed < OUTPUT_DELAY_SETTLE_WINDOW {
+                    250_000
+                } else {
+                    250_000 + range
+                };
+                tracker.update(start + elapsed, delay);
+            }
+            assert_eq!(
+                tracker.is_settled(),
+                range == OUTPUT_DELAY_SETTLE_TOLERANCE_US
+            );
+        }
     }
 
     #[test]
-    fn test_delay_settle_rejects_plateau_before_further_relaxation() {
-        // Observed on a cold ALSA-over-PulseAudio stream: the delay rests near
-        // 475ms for about a second, then keeps relaxing toward ~256ms. The
-        // plateau alone must not count as settled.
-        let mut t = OutputDelaySettle::new();
-        let plateau = OUTPUT_DELAY_SETTLE_WINDOW * 3;
-        feed(&mut t, std::iter::repeat_n(475_000, plateau));
-        assert!(!t.is_settled(), "a short plateau is not settled");
-        feed(
-            &mut t,
-            (0..OUTPUT_DELAY_SETTLE_WINDOW * 4).map(|i| 475_000 - i as u64 * 1_000),
-        );
-        assert!(!t.is_settled(), "relaxation after the plateau resets it");
+    fn test_delay_settle_jitter_does_not_shorten_windows() {
+        let start = Instant::now();
+        let mut tracker = OutputDelaySettle::new();
+        let mut elapsed = Duration::ZERO;
+        let mut first_settled = None;
+        let mut i = 0;
+        while elapsed <= SETTLE_TIME + OUTPUT_DELAY_SETTLE_WINDOW {
+            tracker.update(start + elapsed, 250_000);
+            if tracker.is_settled() && first_settled.is_none() {
+                first_settled = Some(elapsed);
+            }
+            elapsed += if i % 2 == 0 {
+                Duration::from_millis(7)
+            } else {
+                Duration::from_millis(19)
+            };
+            i += 1;
+        }
+        assert!(first_settled.expect("jittered observations must settle") >= SETTLE_TIME);
     }
 
     #[test]
-    fn test_delay_settle_recovers_after_ramp() {
-        let mut t = OutputDelaySettle::new();
-        feed(
-            &mut t,
-            (0..OUTPUT_DELAY_SETTLE_WINDOW * 2).map(|i| 10_000 + i as u64 * 10_000),
-        );
-        assert!(!t.is_settled());
-        feed(&mut t, std::iter::repeat_n(300_000, SETTLE_CALLBACKS * 2));
-        assert!(t.is_settled(), "settles once the delay stops moving");
-    }
-
-    #[test]
-    fn test_delay_settle_unsettles_when_delay_moves_again() {
-        let mut t = OutputDelaySettle::new();
-        feed(&mut t, std::iter::repeat_n(300_000, SETTLE_CALLBACKS * 2));
-        assert!(t.is_settled());
-        feed(
-            &mut t,
-            std::iter::repeat_n(400_000, OUTPUT_DELAY_SETTLE_WINDOW),
-        );
-        assert!(!t.is_settled(), "a step in the delay un-settles it");
-    }
-
-    #[test]
-    fn test_delay_settle_reset_clears_state() {
-        let mut t = OutputDelaySettle::new();
-        feed(&mut t, std::iter::repeat_n(250_000, SETTLE_CALLBACKS * 2));
-        assert!(t.is_settled());
-        t.reset();
-        assert!(!t.is_settled());
+    fn test_delay_settle_gap_and_reset_require_fresh_evidence() {
+        for gap in [OUTPUT_DELAY_SETTLE_WINDOW, Duration::from_secs(10)] {
+            let start = Instant::now();
+            let period = Duration::from_millis(10);
+            let mut tracker = OutputDelaySettle::new();
+            let callbacks = (SETTLE_TIME.as_nanos() / period.as_nanos()) as u32;
+            for i in 0..=callbacks {
+                tracker.update(start + period * i, 250_000);
+            }
+            assert!(tracker.is_settled());
+            let resumed_at = start + SETTLE_TIME + gap;
+            tracker.update(resumed_at, 250_000);
+            assert!(!tracker.is_settled(), "gap must discard stale evidence");
+            for i in 1..callbacks {
+                tracker.update(resumed_at + period * i, 250_000);
+                assert!(!tracker.is_settled());
+            }
+            tracker.update(resumed_at + SETTLE_TIME, 250_000);
+            assert!(tracker.is_settled());
+            tracker.reset();
+            assert_eq!(tracker.settled_floor_us(), None);
+            tracker.update(resumed_at + SETTLE_TIME + period, 250_000);
+            assert!(!tracker.is_settled());
+        }
     }
 
     #[test]
